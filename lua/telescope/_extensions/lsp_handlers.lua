@@ -1,256 +1,347 @@
 local telescope = require('telescope')
-local pickers = require('telescope.pickers')
-local finders = require('telescope.finders')
-local actions = require('telescope.actions')
-local action_state = require('telescope.actions.state')
-local make_entry = require('telescope.make_entry')
-local conf = require('telescope.config').values
+local channel = require("plenary.async.control").channel
 
-local lsp_util = vim.lsp.util
-local lsp_buf = vim.lsp.buf
-local jump_to_location = lsp_util.jump_to_location
+local conf = require("telescope.config").values
+local finders = require "telescope.finders"
+local make_entry = require "telescope.make_entry"
+local pickers = require "telescope.pickers"
+local utils = require "telescope.utils"
 
-local mapping_actions = {
-	['<C-x>'] = actions.file_split,
-	['<C-v>'] = actions.file_vsplit,
-	['<C-t>'] = actions.file_tab,
+local lsp = {}
+
+lsp.opts = {
+    disable = {},
+    location = {
+        telescope = {},
+        no_results_message = 'No references found',
+    },
+    symbol = {
+        telescope = {},
+        no_results_message = 'No symbols found',
+    },
+    call_hierarchy = {
+        telescope = {},
+        no_results_message = 'No calls found',
+    },
+    code_action = {
+        telescope = {},
+        no_results_message = 'No code actions available',
+        prefix = '',
+    },
 }
 
-local function jump_fn(prompt_bufnr, action)
-	return function()
-		local selection = action_state.get_selected_entry(prompt_bufnr)
-		if not selection then
-			return
-		end
+lsp.references = function(opts)
+  local filepath = vim.api.nvim_buf_get_name(opts.bufnr)
+  local lnum = vim.api.nvim_win_get_cursor(opts.winnr)[1]
+  local params = vim.lsp.util.make_position_params(opts.winnr)
+  local include_current_line = vim.F.if_nil(opts.include_current_line, false)
+  params.context = { includeDeclaration = vim.F.if_nil(opts.include_declaration, true) }
 
-		if action then
-			action(prompt_bufnr)
-		else
-			actions.close(prompt_bufnr)
-		end
+  vim.lsp.buf_request(opts.bufnr, "textDocument/references", params, function(err, result, ctx, _)
+    if err then
+      vim.api.nvim_err_writeln("Error when finding references: " .. err.message)
+      opts.handlers(opts)
+      return
+    end
 
-		local pos = {
-			line = selection.lnum - 1,
-			character = selection.col,
-		}
+    local locations = {}
+    if result then
+      local results = vim.lsp.util.locations_to_items(result, vim.lsp.get_client_by_id(ctx.client_id).offset_encoding)
+      if include_current_line then
+        locations = vim.tbl_filter(function(v)
+          -- Remove current line from result
+          return not (v.filename == filepath and v.lnum == lnum)
+        end, vim.F.if_nil(results, {}))
+      else
+        locations = vim.F.if_nil(results, {})
+      end
+    end
 
-		jump_to_location({
-			uri = vim.uri_from_fname(selection.filename),
-			range = {
-				start = pos,
-				['end'] = pos,
-			}
-		})
-	end
+    if vim.tbl_isempty(locations) then
+      opts.handlers(opts)
+      return
+    end
+
+    pickers.new(opts, {
+      prompt_title = "LSP References",
+      finder = finders.new_table {
+        results = locations,
+        entry_maker = opts.entry_maker or make_entry.gen_from_quickfix(opts),
+      },
+      previewer = conf.qflist_previewer(opts),
+      sorter = conf.generic_sorter(opts),
+      push_cursor_on_edit = true,
+      push_tagstack_on_edit = true,
+    }):find()
+  end)
 end
 
-local function attach_location_mappings(prompt_bufnr, map)
-	local modes = {'i', 'n'}
-	local keys = {'<CR>', '<C-x>', '<C-v>', '<C-t>'}
+local function list_or_jump(action, title, opts)
+  opts = opts or {}
 
-	for _, mode in pairs(modes) do
-		for _, key in pairs(keys) do
-			local action = mapping_actions[key]
-			map(mode, key, jump_fn(prompt_bufnr, action))
-		end
-	end
+  local params = vim.lsp.util.make_position_params(opts.winnr)
+  vim.lsp.buf_request(opts.bufnr, action, params, function(err, result, ctx, _)
+    if err then
+      vim.api.nvim_err_writeln("Error when executing " .. action .. " : " .. err.message)
+      opts.handlers(opts)
+      return
+    end
+    local flattened_results = {}
+    if result then
+      -- textDocument/definition can return Location or Location[]
+      if not vim.tbl_islist(result) then
+        flattened_results = { result }
+      end
 
-	-- Additional mappings don't push the item to the tagstack.
-	return true
+      vim.list_extend(flattened_results, result)
+    end
+
+    local offset_encoding = vim.lsp.get_client_by_id(ctx.client_id).offset_encoding
+
+    if #flattened_results == 0 then
+      opts.handlers(opts)
+      return
+    elseif #flattened_results == 1 and opts.jump_type ~= "never" then
+      if opts.jump_type == "tab" then
+        vim.cmd "tabedit"
+      elseif opts.jump_type == "split" then
+        vim.cmd "new"
+      elseif opts.jump_type == "vsplit" then
+        vim.cmd "vnew"
+      end
+      vim.lsp.util.jump_to_location(flattened_results[1], offset_encoding)
+    else
+      local locations = vim.lsp.util.locations_to_items(flattened_results, offset_encoding)
+      pickers.new(opts, {
+        prompt_title = title,
+        finder = finders.new_table {
+          results = locations,
+          entry_maker = opts.entry_maker or make_entry.gen_from_quickfix(opts),
+        },
+        previewer = conf.qflist_previewer(opts),
+        sorter = conf.generic_sorter(opts),
+        push_cursor_on_edit = true,
+        push_tagstack_on_edit = true,
+      }):find()
+    end
+  end)
 end
 
-local function apply_edit_fn(prompt_bufnr)
-	return function()
-		local selection = action_state.get_selected_entry(prompt_bufnr)
-		actions.close(prompt_bufnr)
-		if not selection then
-			return
-		end
-
-		local action = selection.value
-		if action.edit or type(action.command) == "table" then
-			if action.edit then
-				lsp_util.apply_workspace_edit(action.edit)
-			end
-			if type(action.command) == 'table' then
-				lsp_buf.execute_command(action.command)
-			end
-		else
-			lsp_buf.execute_command(action)
-		end
-	end
+lsp.declaration = function(opts)
+  return list_or_jump("textDocument/declaration", "LSP Declaration", opts)
 end
 
-local function attach_code_action_mappings(prompt_bufnr, map)
-	map('i', '<CR>', apply_edit_fn(prompt_bufnr))
-	map('n', '<CR>', apply_edit_fn(prompt_bufnr))
-
-	return true
+lsp.definitions = function(opts)
+  return list_or_jump("textDocument/definition", "LSP Definitions", opts)
 end
 
-local function find(prompt_title, items, find_opts)
-	local opts = find_opts.opts or {}
-
-	local entry_maker = find_opts.entry_maker or make_entry.gen_from_quickfix(opts)
-	local attach_mappings = find_opts.attach_mappings or attach_location_mappings
-	local previewer = nil
-	if not find_opts.hide_preview then
-		previewer = conf.qflist_previewer(opts)
-	end
-
-	pickers.new(opts, {
-		prompt_title = prompt_title,
-		finder = finders.new_table({
-			results = items,
-			entry_maker = entry_maker,
-		}),
-		previewer = previewer,
-		sorter = conf.generic_sorter(opts),
-		attach_mappings = attach_mappings,
-	}):find()
+lsp.type_definitions = function(opts)
+  return list_or_jump("textDocument/typeDefinition", "LSP Type Definitions", opts)
 end
 
-local function get_correct_result(result1, result2)
-  return type(result1) == 'table' and result1 or result2
+lsp.implementations = function(opts)
+  return list_or_jump("textDocument/implementation", "LSP Implementations", opts)
 end
 
-local function location_handler(prompt_title, opts)
-	return function(_, result1, result2, _)
-    local result = get_correct_result(result1, result2)
+lsp.document_symbols = function(opts)
+  local params = vim.lsp.util.make_position_params(opts.winnr)
+  vim.lsp.buf_request(opts.bufnr, "textDocument/documentSymbol", params, function(err, result, _, _)
+    if err then
+      vim.api.nvim_err_writeln("Error when finding document symbols: " .. err.message)
+      opts.handlers(opts)
+      return
+    end
 
-		if not result or vim.tbl_isempty(result) then
-			print(opts.no_results_message)
-			return
-		end
+    if not result or vim.tbl_isempty(result) then
+      utils.notify("builtin.lsp_document_symbols", {
+        msg = "No results from textDocument/documentSymbol",
+        level = "INFO",
+      })
+      opts.handlers(opts)
+      return
+    end
 
-		if not vim.tbl_islist(result) then
-			jump_to_location(result)
-			return
-		end
+    local locations = vim.lsp.util.symbols_to_items(result or {}, opts.bufnr) or {}
+    locations = utils.filter_symbols(locations, opts)
+    if locations == nil then
+      -- error message already printed in `utils.filter_symbols`
+      opts.handlers(opts)
+      return
+    end
 
-		if #result == 1 then
-			jump_to_location(result[1])
-			return
-		end
+    if vim.tbl_isempty(locations) then
+      utils.notify("builtin.lsp_document_symbols", {
+        msg = "No document_symbol locations found",
+        level = "INFO",
+      })
+      opts.handlers(opts)
+      return false
+    end
 
-		local items = lsp_util.locations_to_items(result)
-		find(prompt_title, items, { opts = opts.telescope })
-	end
+    opts.ignore_filename = opts.ignore_filename or true
+    pickers.new(opts, {
+      prompt_title = "LSP Document Symbols",
+      finder = finders.new_table {
+        results = locations,
+        entry_maker = opts.entry_maker or make_entry.gen_from_lsp_symbols(opts),
+      },
+      previewer = conf.qflist_previewer(opts),
+      sorter = conf.prefilter_sorter {
+        tag = "symbol_type",
+        sorter = conf.generic_sorter(opts),
+      },
+      push_cursor_on_edit = true,
+      push_tagstack_on_edit = true,
+    }):find()
+  end)
 end
 
-local function symbol_handler(prompt_name, opts)
-	opts = opts or {}
+lsp.workspace_symbols = function(opts)
+  local params = { query = opts.query or "" }
+  vim.lsp.buf_request(opts.bufnr, "workspace/symbol", params, function(err, server_result, _, _)
+    if err then
+      vim.api.nvim_err_writeln("Error when finding workspace symbols: " .. err.message)
+      opts.handlers(opts)
+      return
+    end
 
-	return function(_, result1, result2, _)
-    local result = get_correct_result(result1, result2)
-		if not result or vim.tbl_isempty(result) then
-			print(opts.no_results_message)
-			return
-		end
+    local locations = vim.lsp.util.symbols_to_items(server_result or {}, opts.bufnr) or {}
+    locations = utils.filter_symbols(locations, opts)
+    if locations == nil then
+      -- error message already printed in `utils.filter_symbols`
+      opts.handlers(opts)
+      return
+    end
 
-		local items = lsp_util.symbols_to_items(result)
-		find(prompt_name, items, { opts = opts.telescope })
-	end
+    if vim.tbl_isempty(locations) then
+      utils.notify("builtin.lsp_workspace_symbols", {
+        msg = "No results from workspace/symbol. Maybe try a different query: "
+          .. "'Telescope lsp_workspace_symbols query=example'",
+        level = "INFO",
+      })
+      opts.handlers(opts)
+      return
+    end
+
+    opts.ignore_filename = utils.get_default(opts.ignore_filename, false)
+
+    pickers.new(opts, {
+      prompt_title = "LSP Workspace Symbols",
+      finder = finders.new_table {
+        results = locations,
+        entry_maker = opts.entry_maker or make_entry.gen_from_lsp_symbols(opts),
+      },
+      previewer = conf.qflist_previewer(opts),
+      sorter = conf.prefilter_sorter {
+        tag = "symbol_type",
+        sorter = conf.generic_sorter(opts),
+      },
+    }):find()
+  end)
 end
 
-local function call_hierarchy_handler(prompt_name, direction, opts)
-	return function(_, result1, result2, _)
-    local result = get_correct_result(result1, result2)
+local function get_workspace_symbols_requester(bufnr, opts)
+  local cancel = function() end
 
-		if not result or vim.tbl_isempty(result) then
-			print(opts.no_results_message)
-			return
-		end
+  return function(prompt)
+    local tx, rx = channel.oneshot()
+    cancel()
+    _, cancel = vim.lsp.buf_request(bufnr, "workspace/symbol", { query = prompt }, tx)
 
-		local items = {}
-		for _, ch_call in pairs(result) do
-			local ch_item = ch_call[direction]
+    -- Handle 0.5 / 0.5.1 handler situation
+    local err, res = rx()
+    assert(not err, err)
 
-			for _, range in pairs(ch_call.fromRanges) do
-				table.insert(items, {
-					filename = vim.uri_to_fname(ch_item.uri),
-					text = ch_item.name,
-					lnum = range.start.line + 1,
-					col = range.start.character + 1,
-				})
-			end
-		end
-		find(prompt_name, items, { opts = opts.telescope })
-	end
+    local locations = vim.lsp.util.symbols_to_items(res or {}, bufnr) or {}
+    if not vim.tbl_isempty(locations) then
+      locations = utils.filter_symbols(locations, opts) or {}
+    end
+    return locations
+  end
 end
 
-local function code_action_handler(prompt_title, opts)
-	return function(_, result1, result2, _)
-    local result = get_correct_result(result1, result2)
+lsp.dynamic_workspace_symbols = function(opts)
+  pickers.new(opts, {
+    prompt_title = "LSP Dynamic Workspace Symbols",
+    finder = finders.new_dynamic {
+      entry_maker = opts.entry_maker or make_entry.gen_from_lsp_symbols(opts),
+      fn = get_workspace_symbols_requester(opts.bufnr, opts),
+    },
+    previewer = conf.qflist_previewer(opts),
+    sorter = conf.generic_sorter(opts),
+  }):find()
+end
 
-		if not result or vim.tbl_isempty(result) then
-			print(opts.no_results_message)
-			return
-		end
+local function check_capabilities(feature, bufnr)
+  local clients = vim.lsp.buf_get_clients(bufnr)
 
-		for idx, value in ipairs(result) do
-			value.idx = idx
-		end
+  local supported_client = false
+  for _, client in pairs(clients) do
+    supported_client = client.server_capabilities[feature]
+    if supported_client then
+      break
+    end
+  end
 
-		local find_opts = {
-			opts = opts.telescope,
-			entry_maker = function(line)
-				return {
-					valid = line ~= nil,
-					value = line,
-					ordinal = line.idx .. line.title,
-					display = string.format('%s%d: %s', opts.prefix, line.idx, line.title),
-				}
-			end,
-			attach_mappings = attach_code_action_mappings,
-			hide_preview = true,
-		}
-		find(prompt_title, result, find_opts)
-	end
+  if supported_client then
+    return true
+  else
+    if #clients == 0 then
+      utils.notify("builtin.lsp_*", {
+        msg = "no client attached",
+        level = "INFO",
+      })
+    else
+      utils.notify("builtin.lsp_*", {
+        msg = "server does not support " .. feature,
+        level = "INFO",
+      })
+    end
+    return false
+  end
+end
+
+local feature_map = {
+  ["document_symbols"] = "documentSymbolProvider",
+  ["references"] = "referencesProvider",
+  ["definitions"] = "definitionProvider",
+  ["type_definitions"] = "typeDefinitionProvider",
+  ["implementations"] = "implementationProvider",
+  ["workspace_symbols"] = "workspaceSymbolProvider",
+  ["declaration"] = "declarationProvider",
+}
+
+local function lsp_handlers(opts)
+    opts = vim.tbl_deep_extend("force", lsp.opts, opts)
+    opts.bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+    opts.winnr = opts.winnr or vim.api.nvim_get_current_win()
+
+    opts.handlers = function (opts)
+        if opts[opts.target] ~= nil and opts[opts.target].handlers ~= nil then
+            if type(opts[opts.target].handlers) == "string" then
+                vim.cmd(opts[opts.target].handlers)
+            elseif type(opts[opts.target].handlers) == "function" then
+                opts[opts.target].handlers(opts)
+            end
+        end
+    end
+
+    local feature_name = feature_map[opts.target]
+    if feature_name and not check_capabilities(feature_name, opts.bufnr) then
+        opts.handlers(opts)
+        return
+    end
+    lsp[opts.target](opts)
 end
 
 return telescope.register_extension({
 	setup = function(opts)
 		-- Use default options if needed.
-		opts = vim.tbl_deep_extend('keep', opts, {
-			disable = {},
-			location = {
-				telescope = {},
-				no_results_message = 'No references found',
-			},
-			symbol = {
-				telescope = {},
-				no_results_message = 'No symbols found',
-			},
-			call_hierarchy = {
-				telescope = {},
-				no_results_message = 'No calls found',
-			},
-			code_action = {
-				telescope = {},
-				no_results_message = 'No code actions available',
-				prefix = '',
-			},
-		})
-
-		local handlers = {
-			['textDocument/declaration'] = location_handler('LSP Declarations', opts.location),
-			['textDocument/definition'] = location_handler('LSP Definitions', opts.location),
-			['textDocument/implementation'] = location_handler('LSP Implementations', opts.location),
-			['textDocument/typeDefinition'] = location_handler('LSP Type Definitions', opts.location),
-			['textDocument/references'] = location_handler('LSP References', opts.location),
-			['textDocument/documentSymbol'] = symbol_handler('LSP Document Symbols', opts.symbol),
-			['workspace/symbol'] = symbol_handler('LSP Workspace Symbols', opts.symbol),
-			['callHierarchy/incomingCalls'] = call_hierarchy_handler('LSP Incoming Calls', 'from', opts.call_hierarchy),
-			['callHierarchy/outgoingCalls'] = call_hierarchy_handler('LSP Outgoing Calls', 'to', opts.call_hierarchy),
-			['textDocument/codeAction'] = code_action_handler('LSP Code Actions', opts.code_action),
-		}
-
-		for req, handler in pairs(handlers) do
-			if not opts.disable[req] then
-				vim.lsp.handlers[req] = handler
-			end
-		end
+        if type(opts) == "table" and opts ~= {} then
+            lsp.opts = vim.tbl_deep_extend('keep', opts, lsp.opts)
+        end
 	end,
-	exports = {},
+	exports = {
+        lsp_handlers = lsp_handlers,
+    },
 })
