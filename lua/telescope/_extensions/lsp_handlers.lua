@@ -34,7 +34,7 @@ lsp.references = function(opts)
   local filepath = vim.api.nvim_buf_get_name(opts.bufnr)
   local lnum = vim.api.nvim_win_get_cursor(opts.winnr)[1]
   local params = vim.lsp.util.make_position_params(opts.winnr)
-  local include_current_line = vim.F.if_nil(opts.include_current_line, false)
+  local include_current_line = vim.F.if_nil(opts.include_current_line, true)
   params.context = { includeDeclaration = vim.F.if_nil(opts.include_declaration, true) }
 
   vim.lsp.buf_request(opts.bufnr, "textDocument/references", params, function(err, result, ctx, _)
@@ -60,6 +60,12 @@ lsp.references = function(opts)
     if vim.tbl_isempty(locations) then
       opts.handlers(opts)
       return
+    end
+
+    if #locations == 1 and opts.jump_type ~= "never" then
+        locations[1].uri = "file://" .. locations[1].filename
+        locations[1].range = { start = {line = locations[1].lnum  - 1, character = locations[1].col - 1}}
+        return vim.lsp.util.jump_to_location(locations[1], vim.lsp.get_client_by_id(ctx.client_id).offset_encoding)
     end
 
     pickers.new(opts, {
